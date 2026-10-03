@@ -1,9 +1,15 @@
-// BodycamMotion - bodycam-style camera movement, applied in image space.
+// BodycamMotion - bodycam-style camera movement, applied in CAMERA space.
 //
-// Every frame, just before the game swaps buffers (eglSwapBuffers hook), the
-// finished frame is copied to a texture and drawn back through a fullscreen
-// pass that rotates / shifts / zooms it. The game's own camera is untouched,
-// so this needs no game-function offsets and survives game updates.
+// Instead of redrawing the finished frame (which shook the whole screen, HUD
+// and menus), we post-multiply the game's view-projection matrix by a small
+// camera-space transform R each frame:  M' = M * R  (column-major), which is
+// exactly equivalent to moving the camera. The world rolls/bobs/sways with
+// real parallax; 2D/ortho draws (HUD, loading screens, menus) are untouched.
+//
+// The view-proj uniform is found without any game offsets: per frame we watch
+// glUniformMatrix4fv uploads; a (program, location) pair that receives >=2
+// identical perspective matrices in one frame is the shared view-proj uniform.
+// From the next frame on, every upload to that location is patched.
 //
 // Movement input comes from touch events (Levi Input API): a touch on the left
 // half = moving, drag on the right half = turning.
@@ -17,8 +23,10 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 
 #include <pl/Config.hpp>
 #include <pl/Input.hpp>
@@ -31,6 +39,13 @@ namespace {
 
 using bodycam::Tuning;
 
+// Camera-space gains (how strongly the motion model drives the camera).
+constexpr float kRollGain   = 1.0f;   // out.rollRad -> camera roll
+constexpr float kBobPitch   = 0.35f;  // out.offY    -> camera pitch (rad scale)
+constexpr float kShiftGain  = 0.25f;  // out.offX/Y  -> camera translation (units)
+constexpr int   kMinRepeats = 2;      // identical uploads/frame to trust a uniform
+constexpr int   kLearnFrames = 120;   // frames before "no shared VP" is reported
+
 // ---------------------------------------------------------------- state ----
 ll::mod::NativeMod *gSelf;
 Tuning gTuning;
@@ -39,8 +54,101 @@ bodycam::Motion gMotion;
 using SwapFn = EGLBoolean (*)(EGLDisplay, EGLSurface);
 SwapFn gSwap;
 void *gSwapTarget;
+
+using UM4Fn = void (*)(GLint, GLsizei, GLboolean, const GLfloat *);
+UM4Fn gUM4;
+void *gUM4Target;
+
 std::atomic<bool> gActive{false};
 std::atomic<int> gSurfW{0}, gSurfH{0};
+
+// Camera-space transform for the frame being rendered (column-major 4x4).
+float gR[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+// ------------------------------------------------------------- mat4 math ----
+void mat4Mul(const float *a, const float *b, float *out) {  // out = a * b
+    float t[16];
+    for (int c = 0; c < 4; ++c)
+        for (int r = 0; r < 4; ++r)
+            t[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
+                           a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    std::memcpy(out, t, sizeof(t));
+}
+
+void buildCameraR(const bodycam::Output &o) {
+    // R = Rz(roll) * Rx(pitch) * T(shift): roll outermost, translation innermost.
+    const float cr = std::cos(o.rollRad * kRollGain), sr = std::sin(o.rollRad * kRollGain);
+    const float cp = std::cos(o.offY * kBobPitch), sp = std::sin(o.offY * kBobPitch);
+    const float tx = o.offX * kShiftGain, ty = o.offY * kShiftGain * 0.5f;
+
+    float rz[16] = {cr, sr, 0, 0, -sr, cr, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    float rx[16] = {1, 0, 0, 0, 0, cp, sp, 0, 0, -sp, cp, 0, 0, 0, 0, 1};
+    float tr[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, tx, ty, 0, 1};
+
+    float tmp[16];
+    mat4Mul(rx, tr, tmp);
+    mat4Mul(rz, tmp, gR);
+}
+
+// ------------------------------------------------------- VP uniform learn ----
+struct UniformStats {
+    int count = 0;
+    bool allEqual = true;
+    bool marked = false;
+    float first[16] = {};
+};
+struct Key {
+    GLuint prog;
+    GLint loc;
+    bool operator==(const Key &o) const { return prog == o.prog && loc == o.loc; }
+};
+struct KeyHash {
+    size_t operator()(const Key &k) const {
+        return std::hash<uint64_t>{}((uint64_t(k.prog) << 32) | uint32_t(k.loc));
+    }
+};
+std::unordered_map<Key, UniformStats, KeyHash> gStats;
+int gMarkedCount = 0;
+int gFrames = 0;
+bool gLearnReported = false;
+
+inline bool isPerspectiveish(const float *m) {
+    // Ortho/HUD matrices have w-row == (0,0,0,1); perspective combos don't.
+    return !(std::fabs(m[12]) < 1e-6f && std::fabs(m[13]) < 1e-6f &&
+             std::fabs(m[14]) < 1e-6f && std::fabs(m[15] - 1.0f) < 1e-6f);
+}
+
+inline bool matEq(const float *a, const float *b) {
+    for (int i = 0; i < 16; ++i)
+        if (std::fabs(a[i] - b[i]) > 1e-3f) return false;
+    return true;
+}
+
+// Finalize learning for the frame that just finished; prepare per-frame stats.
+void finalizeFrameLearning() {
+    gMarkedCount = 0;
+    for (auto &kv : gStats) {
+        UniformStats &s = kv.second;
+        if (!s.marked && s.count >= kMinRepeats && s.allEqual) {
+            s.marked = true;
+            gSelf->getLogger().info("View-proj uniform learned (program {}, location {})",
+                                    kv.first.prog, kv.first.loc);
+        } else if (s.marked && (s.count == 0 || !s.allEqual)) {
+            s.marked = false;  // location reused for something else this frame
+            gSelf->getLogger().warn("View-proj uniform unmarked (program {}, location {})",
+                                    kv.first.prog, kv.first.loc);
+        }
+        if (s.marked) ++gMarkedCount;
+        s.count = 0;
+        s.allEqual = true;
+    }
+    if (gMarkedCount == 0 && ++gFrames > kLearnFrames && !gLearnReported) {
+        gLearnReported = true;
+        gSelf->getLogger().warn(
+            "No shared view-proj uniform detected: this renderer uploads combined "
+            "per-object matrices, camera-space mode cannot engage.");
+    }
+}
 
 // ---------------------------------------------------------------- touch ----
 struct Pointer {
@@ -103,191 +211,40 @@ bodycam::Input readInput(double dt, int w, int h) {
     return in;
 }
 
-// ------------------------------------------------------------------- GL ----
-const char *kVert = R"(#version 300 es
-out vec2 vQ;
-void main() {
-    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-    vQ = p * 2.0 - 1.0;
-    gl_Position = vec4(vQ, 0.0, 1.0);
-})";
-
-const char *kFrag = R"(#version 300 es
-precision highp float;
-in vec2 vQ;
-uniform sampler2D uTex;
-uniform float uAspect;
-uniform float uCos;
-uniform float uSin;
-uniform vec2 uOff;
-uniform float uZoom;
-out vec4 oColor;
-void main() {
-    vec2 q = vec2(vQ.x * uAspect, vQ.y);
-    vec2 s = vec2(uCos * q.x - uSin * q.y, uSin * q.x + uCos * q.y) / uZoom + uOff;
-    vec2 uv = vec2(s.x / uAspect, s.y) * 0.5 + 0.5;
-    oColor = vec4(texture(uTex, uv).rgb, 1.0);
-})";
-
-struct GlRes {
-    EGLContext ctx = EGL_NO_CONTEXT;
-    GLuint prog = 0, vao = 0, tex = 0;
-    GLint uAspect = -1, uCos = -1, uSin = -1, uOff = -1, uZoom = -1, uTex = -1;
-    int texW = 0, texH = 0;
-};
-GlRes gRes;
-bool gGlFailed = false;
-
-GLuint compile(GLenum type, const char *src) {
-    GLuint s = glCreateShader(type);
-    glShaderSource(s, 1, &src, nullptr);
-    glCompileShader(s);
-    GLint ok = 0;
-    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[512] = {};
-        glGetShaderInfoLog(s, sizeof(log), nullptr, log);
-        gSelf->getLogger().error("shader compile failed: {}", log);
-        glDeleteShader(s);
-        return 0;
-    }
-    return s;
-}
-
-bool createResources() {
-    GLuint vs = compile(GL_VERTEX_SHADER, kVert);
-    GLuint fs = compile(GL_FRAGMENT_SHADER, kFrag);
-    if (!vs || !fs) return false;
-    GLuint prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    GLint ok = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        gSelf->getLogger().error("program link failed");
-        glDeleteProgram(prog);
-        return false;
-    }
-    gRes.prog = prog;
-    gRes.uAspect = glGetUniformLocation(prog, "uAspect");
-    gRes.uCos = glGetUniformLocation(prog, "uCos");
-    gRes.uSin = glGetUniformLocation(prog, "uSin");
-    gRes.uOff = glGetUniformLocation(prog, "uOff");
-    gRes.uZoom = glGetUniformLocation(prog, "uZoom");
-    gRes.uTex = glGetUniformLocation(prog, "uTex");
-    glGenVertexArrays(1, &gRes.vao);
-    glGenTextures(1, &gRes.tex);
-    return true;
-}
-
-// Saves the GL state we touch and restores it on scope exit.
-struct StateGuard {
-    GLint prog, vao, activeTex, tex0, sampler0, drawFbo, readFbo, viewport[4], colorMask[4];
-    GLboolean scissor, depth, blend, cull, stencil, dither, depthMask;
-    StateGuard() {
-        glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
-        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
-        glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTex);
-        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
-        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
-        glGetIntegerv(GL_VIEWPORT, viewport);
-        glGetBooleanv(GL_COLOR_WRITEMASK, reinterpret_cast<GLboolean *>(colorMask));
-        glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
-        scissor = glIsEnabled(GL_SCISSOR_TEST);
-        depth = glIsEnabled(GL_DEPTH_TEST);
-        blend = glIsEnabled(GL_BLEND);
-        cull = glIsEnabled(GL_CULL_FACE);
-        stencil = glIsEnabled(GL_STENCIL_TEST);
-        dither = glIsEnabled(GL_DITHER);
-        glActiveTexture(GL_TEXTURE0);
-        glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
-        glGetIntegerv(GL_SAMPLER_BINDING, &sampler0);
-    }
-    ~StateGuard() {
-        glBindSampler(0, static_cast<GLuint>(sampler0));
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(tex0));
-        glActiveTexture(static_cast<GLenum>(activeTex));
-        glBindVertexArray(static_cast<GLuint>(vao));
-        glUseProgram(static_cast<GLuint>(prog));
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(drawFbo));
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(readFbo));
-        glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-        const GLboolean *m = reinterpret_cast<const GLboolean *>(colorMask);
-        glColorMask(m[0], m[1], m[2], m[3]);
-        glDepthMask(depthMask);
-        auto set = [](GLenum cap, GLboolean on) { on ? glEnable(cap) : glDisable(cap); };
-        set(GL_SCISSOR_TEST, scissor);
-        set(GL_DEPTH_TEST, depth);
-        set(GL_BLEND, blend);
-        set(GL_CULL_FACE, cull);
-        set(GL_STENCIL_TEST, stencil);
-        set(GL_DITHER, dither);
-    }
-};
-
-void drawPass(int w, int h, const bodycam::Output &o) {
-    const EGLContext ctx = eglGetCurrentContext();
-    if (ctx == EGL_NO_CONTEXT) return;
-    if (ctx != gRes.ctx) {  // first frame, or the game recreated its context
-        gRes = {};
-        gRes.ctx = ctx;
-        if (!createResources()) {
-            gGlFailed = true;
-            return;
-        }
-        gSelf->getLogger().info("Motion pass ready ({}x{})", w, h);
-    }
-
-    StateGuard guard;
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    glBindSampler(0, 0);
-    glBindTexture(GL_TEXTURE_2D, gRes.tex);
-    if (gRes.texW != w || gRes.texH != h) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        gRes.texW = w;
-        gRes.texH = h;
-    }
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);  // frame -> texture
-
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_STENCIL_TEST);
-    glDisable(GL_DITHER);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glViewport(0, 0, w, h);
-
-    glUseProgram(gRes.prog);
-    glUniform1i(gRes.uTex, 0);
-    glUniform1f(gRes.uAspect, static_cast<float>(w) / static_cast<float>(h));
-    glUniform1f(gRes.uCos, static_cast<float>(std::cos(o.rollRad)));
-    glUniform1f(gRes.uSin, static_cast<float>(std::sin(o.rollRad)));
-    glUniform2f(gRes.uOff, static_cast<float>(o.offX), static_cast<float>(o.offY));
-    glUniform1f(gRes.uZoom, static_cast<float>(o.zoom));
-    glBindVertexArray(gRes.vao);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-}
-
-// ----------------------------------------------------------------- hook ----
+// ----------------------------------------------------------------- hooks ----
 double nowSeconds() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
 
+void GL_APIENTRY uniformMatrix4fvHook(GLint location, GLsizei count, GLboolean transpose,
+                                      const GLfloat *value) {
+    if (gActive.load() && gTuning.enabled && value && count == 1 && !transpose &&
+        gMarkedCount >= 0 && isPerspectiveish(value)) {
+        GLint prog = 0;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+        UniformStats &s = gStats[Key{GLuint(prog), location}];
+        if (s.marked) {
+            float out[16];
+            mat4Mul(value, gR, out);  // M' = M * R  -> camera-space transform
+            gUM4(location, count, transpose, out);
+            return;
+        }
+        // Learning: is this location receiving the same perspective matrix repeatedly?
+        if (s.count == 0) {
+            std::memcpy(s.first, value, sizeof(s.first));
+        } else if (s.allEqual) {
+            s.allEqual = matEq(s.first, value);
+        }
+        ++s.count;
+    }
+    gUM4(location, count, transpose, value);
+}
+
 EGLBoolean swapHook(EGLDisplay dpy, EGLSurface surf) {
     static double last = 0.0;
-    if (gActive.load() && gTuning.enabled && !gGlFailed) {
+    if (gActive.load() && gTuning.enabled) {
         EGLint w = 0, h = 0;
         eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
         eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
@@ -299,7 +256,8 @@ EGLBoolean swapHook(EGLDisplay dpy, EGLSurface surf) {
             last = now;
             const auto in = readInput(dt, w, h);
             const auto out = gMotion.update(dt, in, static_cast<double>(w) / h);
-            drawPass(w, h, out);
+            buildCameraR(out);       // R used by all patched uploads next frame
+            finalizeFrameLearning(); // close stats for the frame just rendered
         }
     }
     return gSwap(dpy, surf);
@@ -332,18 +290,26 @@ public:
             mSelf.getLogger().error("Failed to hook eglSwapBuffers");
             return false;
         }
+        gUM4Target = dlsym(RTLD_DEFAULT, "glUniformMatrix4fv");
+        if (!gUM4Target ||
+            pl::memory::hook(gUM4Target, reinterpret_cast<void *>(&uniformMatrix4fvHook),
+                             reinterpret_cast<void **>(&gUM4)) != 0) {
+            mSelf.getLogger().error("Failed to hook glUniformMatrix4fv");
+            return false;
+        }
         if (!mInputRegistered) {  // the Input API has no unregister
             pl::input::registerTouchCallback(&onTouch);
             mInputRegistered = true;
         }
         gActive.store(true);
-        mSelf.getLogger().info("Bodycam motion active");
+        mSelf.getLogger().info("Bodycam motion active (camera-space)");
         return true;
     }
 
     bool disable() {
         gActive.store(false);
         if (gSwapTarget) pl::memory::unhook(gSwapTarget, reinterpret_cast<void *>(&swapHook));
+        if (gUM4Target) pl::memory::unhook(gUM4Target, reinterpret_cast<void *>(&uniformMatrix4fvHook));
         return true;
     }
 

@@ -1,38 +1,32 @@
-cmake_minimum_required(VERSION 3.22)
-project(BodycamMotion LANGUAGES CXX)
+name: Build Bodycam Motion
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+on:
+  push:
+  workflow_dispatch:
 
-include(FetchContent)
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-# 1. Fetch Boost PFR explicitly so we can access its headers directly
-FetchContent_Declare(
-    boost_pfr
-    GIT_REPOSITORY https://github.com/boostorg/pfr.git
-    GIT_TAG boost-1.88.0
-)
-FetchContent_MakeAvailable(boost_pfr)
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release
 
-# 2. Fetch the preloader SDK
-FetchContent_Declare(
-    preloader_android
-    GIT_REPOSITORY https://github.com/LiteLDev/preloader-android.git
-    GIT_TAG 0.2.2)
-FetchContent_MakeAvailable(preloader_android)
+      - name: Build
+        run: cmake --build build -j
 
-add_library(BodycamMotion SHARED src/BodycamMotion.cpp)
+      - name: Package
+        run: |
+          mkdir -p dist/BodycamMotion
+          cp build/libBodycamMotion.so manifest.json README.md dist/BodycamMotion/
 
-# 3. Manually add the include directory for Boost PFR since the preloader 
-#    links it as PRIVATE and doesn't propagate the headers to our mod.
-target_include_directories(BodycamMotion PRIVATE ${boost_pfr_SOURCE_DIR}/include)
-
-target_link_libraries(BodycamMotion PRIVATE 
-    preloader 
-    android 
-    log 
-    EGL 
-    GLESv3
-)
-
-target_compile_options(BodycamMotion PRIVATE -fvisibility=hidden -Wall -Wextra)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BodycamMotion
+          path: dist/BodycamMotion/

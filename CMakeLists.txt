@@ -6,13 +6,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
-# 1. Fetch Boost PFR explicitly so we can access its headers directly
+# 1. Fetch dependencies that preloader links as PRIVATE but exposes in its headers
 FetchContent_Declare(
     boost_pfr
     GIT_REPOSITORY https://github.com/boostorg/pfr.git
     GIT_TAG boost-1.88.0
 )
-FetchContent_MakeAvailable(boost_pfr)
+FetchContent_Declare(
+    magic_enum
+    GIT_REPOSITORY https://github.com/Neargye/magic_enum.git
+    GIT_TAG v0.9.7
+)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+)
+
+FetchContent_MakeAvailable(boost_pfr magic_enum nlohmann_json)
 
 # 2. Fetch the preloader SDK
 FetchContent_Declare(
@@ -23,8 +34,12 @@ FetchContent_MakeAvailable(preloader_android)
 
 add_library(BodycamMotion SHARED src/BodycamMotion.cpp)
 
-# 3. Manually add the include directory for Boost PFR
-target_include_directories(BodycamMotion PRIVATE ${boost_pfr_SOURCE_DIR}/include)
+# 3. Manually add the include directories for the PRIVATE dependencies
+target_include_directories(BodycamMotion PRIVATE 
+    ${boost_pfr_SOURCE_DIR}/include
+    ${magic_enum_SOURCE_DIR}/include
+    ${nlohmann_json_SOURCE_DIR}/include
+)
 
 target_link_libraries(BodycamMotion PRIVATE 
     preloader 

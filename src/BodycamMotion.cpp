@@ -269,7 +269,6 @@ class BodycamMotion {
 public:
     static BodycamMotion &instance() {
         static BodycamMotion inst;
-        return inst;
     }
 
     BodycamMotion() : mSelf(*ll::mod::NativeMod::current()) { gSelf = &mSelf; }

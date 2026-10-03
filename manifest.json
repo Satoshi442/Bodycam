@@ -1,0 +1,9 @@
+{
+  "type": "preload-native",
+  "name": "Bodycam Motion",
+  "author": "Kunal",
+  "description": "Bodycam-style camera movement: walking bob, turning/strafing roll and idle sway. Motion model ideas from CameraOverhaul by LENDS DZIN (used with permission).",
+  "version": "0.1.0",
+  "entry": "libBodycamMotion.so",
+  "minecraft_versions": []
+}

@@ -32,7 +32,11 @@ FetchContent_Declare(
     GIT_TAG 0.2.2)
 FetchContent_MakeAvailable(preloader_android)
 
-add_library(BodycamMotion SHARED src/BodycamMotion.cpp)
+add_library(BodycamMotion SHARED 
+src/BodycamMotion.cpp
+src/Motion.hpp
+src/Spring.hpp
+)
 
 # 3. Manually add the include directories for the PRIVATE dependencies
 target_include_directories(BodycamMotion PRIVATE 

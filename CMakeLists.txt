@@ -32,6 +32,13 @@ FetchContent_Declare(
     GIT_TAG 0.2.2)
 FetchContent_MakeAvailable(preloader_android)
 
+# Assuming you cloned the SDK into a folder named "sdk" or "LeviLance"
+# Adjust the path to where you actually put the headers
+include_directories(${CMAKE_SOURCE_DIR}/sdk/include) 
+
+# OR if the headers are directly in a folder named "pl"
+include_directories(${CMAKE_SOURCE_DIR}/sdk)
+
 add_library(BodycamMotion SHARED 
 src/BodycamMotion.cpp
 src/Motion.hpp

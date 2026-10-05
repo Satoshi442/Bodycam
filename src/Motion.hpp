@@ -6,36 +6,28 @@
 namespace bodycam {
 
 struct Tuning {
-    int version = 2;
+    int version = 3;
     bool enabled = true;
 
-    // Step / Footstep Impacts (The core of the Bodycam feel)
-    double stepDistance = 2.2;      // Virtual blocks between steps
-    double stepImpactY = -0.06;     // Vertical drop shock per step
-    double stepImpactX = 0.03;      // Lateral sway shock per step
-    double stepImpactPitch = 2.5;   // Degrees of "nod" shock per step
-    double stepImpactYaw = 1.2;     // Degrees of "twist" shock per step
-    double stepImpactRoll = 0.8;    // Micro-tilt shock per step
+    // Reference mod parameters (from strings.txt)
+    double verticalPitchIntensity = 8.0;   // Degrees of pitch nod per step
+    double turningRollIntensity = 6.0;     // Degrees of roll per turn unit
+    double strafingRollIntensity = 4.0;    // Degrees of roll when strafing
+    double swayIntensity = 3.0;            // Idle sway amplitude (degrees)
+    double swayFrequency = 0.8;            // Hz
+    double overallSmoothness = 0.12;       // Spring damping factor
 
-    // Spring Physics (Inertia & Lag)
-    double pitchStiffness = 60.0;
-    double pitchDamping = 9.0;
-    double yawStiffness = 80.0;     // Higher = less turn lag
-    double yawDamping = 12.0;
-    double posStiffness = 50.0;
-    double posDamping = 8.0;
+    // Step detection
+    double stepDistance = 1.8;             // Virtual blocks between steps
+    double stepImpactY = -0.08;            // Vertical drop shock
+    double stepImpactX = 0.04;             // Lateral shock
 
-    // Movement influence (Leaning)
-    double movePitchLean = -0.04;   // Pitch down slightly when sprinting forward
-    double strafeRollLean = 0.03;   // Roll slightly when strafing
-    double strafeXLean = 0.02;      // Shift camera laterally when strafing
-    double turnYawLag = 0.06;       // How much the camera trails behind the crosshair
+    // Movement lean
+    double movePitchLean = -0.06;          // Pitch down when moving forward
+    double strafeXLean = 0.03;             // Lateral shift when strafing
+    double turnYawLag = 0.08;              // Camera trails behind crosshair
 
-    // Idle Sway & Breathing
-    double idleSwayIntensity = 0.5;
-    double idleBreathIntensity = 0.004;
-    
-    // Touch input mapping
+    // Touch input
     double joystickRadius = 0.12;
     double maxTurnSpeed = 1.2;
 };
@@ -59,88 +51,87 @@ struct Output {
 class Motion {
 public:
     explicit Motion(const Tuning &t = {}) : t_(t) {}
-    void setTuning(const Tuning &t) { t_ = t; }
+    void setTuning(const Tuning &t) { t_ = t; reset(); }
+    void reset() {
+        sPitch_.reset(); sYaw_.reset(); sRoll_.reset();
+        sX_.reset(); sY_.reset(); sZ_.reset();
+        dist_ = 0.f; steps_ = 0; idleT_ = 0.f; idleBlend_ = 0.f;
+    }
 
     Output update(double dt, const Input &in, double aspect) {
         dt = std::clamp(dt, 0.0, 0.1);
         float fdt = static_cast<float>(dt);
+        float smooth = static_cast<float>(t_.overallSmoothness);
 
-        // 1. Virtual Velocity (Estimating distance traveled for footsteps)
+        // --- Step Detection ---
         float speed = std::sqrt(in.forward * in.forward + in.strafe * in.strafe);
-        if (in.moving) {
-            distanceTraveled_ += speed * fdt * 4.5f; 
+        if (in.moving) dist_ += speed * fdt * 5.0f;
+
+        if (dist_ > t_.stepDistance) {
+            dist_ -= t_.stepDistance;
+            steps_++;
+            float side = (steps_ % 2 == 0) ? 1.f : -1.f;
+            float deg2rad = 0.01745329f;
+
+            sPitch_.impulse(static_cast<float>(t_.verticalPitchIntensity) * deg2rad * 18.f);
+            sRoll_.impulse(static_cast<float>(t_.strafingRollIntensity) * side * deg2rad * 12.f);
+            sY_.impulse(static_cast<float>(t_.stepImpactY) * 25.f);
+            sX_.impulse(static_cast<float>(t_.stepImpactX) * side * 25.f);
         }
 
-        // 2. Step Impacts (Triggering physical shocks)
-        if (distanceTraveled_ > t_.stepDistance) {
-            distanceTraveled_ -= t_.stepDistance;
-            stepCount_++;
-            float side = (stepCount_ % 2 == 0) ? 1.0f : -1.0f; // Alternate left/right foot
-            
-            springY_.impulse(static_cast<float>(t_.stepImpactY) * 20.0f);
-            springX_.impulse(static_cast<float>(t_.stepImpactX) * side * 20.0f);
-            springPitch_.impulse(static_cast<float>(t_.stepImpactPitch) * 0.01745f * 15.0f);
-            springYaw_.impulse(static_cast<float>(t_.stepImpactYaw) * side * 0.01745f * 15.0f);
-            springRoll_.impulse(static_cast<float>(t_.stepImpactRoll) * side * 0.01745f * 10.0f);
-        }
+        // --- Targets ---
+        sPitch_.target = in.moving ? static_cast<float>(in.forward) * static_cast<float>(t_.movePitchLean) : 0.f;
+        sRoll_.target  = in.moving ? static_cast<float>(in.strafe) * static_cast<float>(t_.strafingRollIntensity) * 0.01745329f : 0.f;
+        sX_.target     = in.moving ? static_cast<float>(in.strafe) * static_cast<float>(t_.strafeXLean) : 0.f;
+        sYaw_.target   = -static_cast<float>(in.turnSpeed) * 1.5f * static_cast<float>(t_.turnYawLag);
 
-        // 3. Targets based on input (Leaning / Lag)
-        springPitch_.target = in.moving ? static_cast<float>(in.forward) * static_cast<float>(t_.movePitchLean) : 0.f;
-        springRoll_.target  = in.moving ? static_cast<float>(in.strafe) * static_cast<float>(t_.strafeRollLean) : 0.f;
-        springX_.target     = in.moving ? static_cast<float>(in.strafe) * static_cast<float>(t_.strafeXLean) : 0.f;
+        // Turning roll (continuous, not just step-based)
+        float turnRollTarget = -static_cast<float>(in.turnSpeed) * static_cast<float>(t_.turningRollIntensity) * 0.01745329f;
+        sRoll_.target += turnRollTarget;
 
-        // Yaw lag: camera trails behind the crosshair when turning
-        float turnRad = static_cast<float>(in.turnSpeed) * 1.5f; 
-        springYaw_.target = -turnRad * static_cast<float>(t_.turnYawLag);
+        // --- Spring Parameters ---
+        float stiff = 80.f;
+        float damp = 12.f / std::max(smooth, 0.01f);
+        sPitch_.stiffness = stiff; sPitch_.damping = damp;
+        sYaw_.stiffness   = stiff; sYaw_.damping   = damp;
+        sRoll_.stiffness  = stiff; sRoll_.damping  = damp;
+        sX_.stiffness     = 60.f;  sX_.damping     = damp;
+        sY_.stiffness     = 60.f;  sY_.damping     = damp;
+        sZ_.stiffness     = 60.f;  sZ_.damping     = damp;
 
-        // 4. Update Spring Parameters from Config
-        springPitch_.stiffness = t_.pitchStiffness; springPitch_.damping = t_.pitchDamping;
-        springYaw_.stiffness   = t_.yawStiffness;   springYaw_.damping   = t_.yawDamping;
-        springRoll_.stiffness  = 60.f;              springRoll_.damping  = 8.f;
-        springX_.stiffness     = t_.posStiffness;   springX_.damping     = t_.posDamping;
-        springY_.stiffness     = t_.posStiffness;   springY_.damping     = t_.posDamping;
-        springZ_.stiffness     = t_.posStiffness;   springZ_.damping     = t_.posDamping;
+        // --- Simulate ---
+        sPitch_.update(fdt); sYaw_.update(fdt); sRoll_.update(fdt);
+        sX_.update(fdt); sY_.update(fdt); sZ_.update(fdt);
 
-        // 5. Step Springs (Physics Simulation)
-        springPitch_.update(fdt);
-        springYaw_.update(fdt);
-        springRoll_.update(fdt);
-        springX_.update(fdt);
-        springY_.update(fdt);
-        springZ_.update(fdt);
+        // --- Idle Sway & Breath ---
+        idleT_ += fdt;
+        float idleFactor = in.moving ? 0.f : 1.f;
+        idleBlend_ += (idleFactor - idleBlend_) * fdt * 2.f;
 
-        // 6. Idle Sway & Breathing (Micro-jitters when standing still)
-        idleTime_ += fdt;
-        float idleFactor = in.moving ? 0.0f : 1.0f;
-        idleBlend_ += (idleFactor - idleBlend_) * fdt * 2.0f; // Smooth fade
+        float sw = static_cast<float>(t_.swayIntensity) * 0.01745329f;
+        float sf = static_cast<float>(t_.swayFrequency);
+        float swayP = (std::sin(idleT_ * sf * 6.2832f) + 0.5f * std::sin(idleT_ * sf * 10.68f)) * sw * idleBlend_;
+        float swayY = (std::sin(idleT_ * sf * 5.0265f) + 0.5f * std::cos(idleT_ * sf * 3.1416f)) * sw * idleBlend_;
+        float swayR = std::sin(idleT_ * sf * 5.6549f) * sw * 0.5f * idleBlend_;
+        float breath = std::sin(idleT_ * 1.5f) * 0.004f * idleBlend_;
 
-        float swayPitch = std::sin(idleTime_ * 1.1f) * 0.002f + std::sin(idleTime_ * 0.7f) * 0.001f;
-        float swayYaw   = std::sin(idleTime_ * 0.8f) * 0.002f + std::cos(idleTime_ * 0.5f) * 0.001f;
-        float swayRoll  = std::sin(idleTime_ * 0.9f) * 0.001f;
-        float breathY   = std::sin(idleTime_ * 1.5f) * 0.003f;
-
-        // 7. Compile Output
+        // --- Output ---
         Output o;
-        o.pitchRad = springPitch_.value + swayPitch * idleBlend_ * static_cast<float>(t_.idleSwayIntensity);
-        o.yawRad   = springYaw_.value   + swayYaw   * idleBlend_ * static_cast<float>(t_.idleSwayIntensity);
-        o.rollRad  = springRoll_.value  + swayRoll  * idleBlend_ * static_cast<float>(t_.idleSwayIntensity);
-        
-        o.offX = springX_.value;
-        o.offY = springY_.value + breathY * idleBlend_ * static_cast<float>(t_.idleBreathIntensity);
-        o.offZ = springZ_.value;
-
+        o.pitchRad = sPitch_.value + swayP;
+        o.yawRad   = sYaw_.value;
+        o.rollRad  = sRoll_.value + swayR;
+        o.offX     = sX_.value;
+        o.offY     = sY_.value + breath;
+        o.offZ     = sZ_.value;
         return o;
     }
 
 private:
     Tuning t_;
-    Spring springPitch_, springYaw_, springRoll_;
-    Spring springX_, springY_, springZ_;
-    
-    float distanceTraveled_ = 0.f;
-    int stepCount_ = 0;
-    float idleTime_ = 0.f;
-    float idleBlend_ = 0.f;
+    Spring sPitch_, sYaw_, sRoll_, sX_, sY_, sZ_;
+    float dist_ = 0.f;
+    int steps_ = 0;
+    float idleT_ = 0.f, idleBlend_ = 0.f;
 };
 
 } // namespace bodycam
